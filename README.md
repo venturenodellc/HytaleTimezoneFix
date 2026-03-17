@@ -80,13 +80,13 @@ The build shades ASM into the agent, so there are no external runtime dependenci
 ## Frequently asked questions
 
 - Q: Do I need to change server configs?
-  A: No. Optionally set TZ or -Duser.timezone if you want an explicit timezone.
+  - A: No. Optionally set TZ or -Duser.timezone if you want an explicit timezone.
 
 - Q: What timezone is used if nothing is configured?
-  A: The JVM default (often inherited from the host OS). If the agent can’t patch or resolve, logs remain in the game’s typical behavior (usually UTC).
+  - A: The JVM default (often inherited from the host OS). If the agent can’t patch or resolve, logs remain in the game’s typical behavior (usually UTC).
 
 - Q: Does this affect gameplay?
-  A: No. Only log formatting is impacted.
+  - A: No. Only log formatting is impacted.
 
 ## License
 

@@ -1,0 +1,17 @@
+# Maven build output
+target/
+dependency-reduced-pom.xml
+
+# IntelliJ
+.idea/
+*.iws
+*.iml
+out/
+
+# Manually downloaded deps (if present)
+asm-*.jar
+manifest.mf
+
+# OS
+.DS_Store
+Thumbs.db

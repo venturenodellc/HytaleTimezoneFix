@@ -90,4 +90,4 @@ The build shades ASM into the agent, so there are no external runtime dependenci
 
 ## License
 
-This project is provided under an open-source license. See LICENSE for details.
+This project is provided under an MIT license. See LICENSE for details.

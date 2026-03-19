@@ -3,6 +3,7 @@ package bisecthosting.agent;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
 import java.security.ProtectionDomain;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.objectweb.asm.*;
 
@@ -10,21 +11,37 @@ import org.objectweb.asm.*;
  * Java agent that patches HytaleLogFormatter to use the system/TZ-env timezone
  * instead of the hardcoded ZoneOffset.UTC.
  *
- * Attach with: -javaagent:HytaleTimezoneFix.jar
- * Respects (in priority order):
- *   1. TZ environment variable  (e.g. TZ=America/New_York)
- *   2. user.timezone JVM property  (e.g. -Duser.timezone=Europe/Berlin)
- *   3. ZoneId.systemDefault()
- *
  * Intentionally avoids java.util.logging during premain — touching JUL before
  * the server starts causes HytaleLogManager initialisation to fail.
+ *
+ * Compatibility note — EarlyPlugin conflict:
+ *
+ *   Hytale's EarlyPlugin system uses TransformingClassLoader (a URLClassLoader
+ *   subclass) to load and define classes from HytaleServer.jar. Before each
+ *   defineClass() call it passes bytecode through registered ClassTransformer
+ *   implementations. Because TransformingClassLoader calls defineClass(), the
+ *   JVM's JVMTI hook fires — meaning our transform() callback is invoked with
+ *   loader = TransformingClassLoader during the early-plugin pass, and then
+ *   again when the class reaches its final definition point.
  */
 public class HytaleTzAgent {
 
     public static void premain(String agentArgs, Instrumentation inst) {
         System.out.println("[HytaleTimezoneFix] Initializing agent");
+        // Append the agent jar to the bootstrap classpath so that bisecthosting.agent.TzResolver is visible from every classloader
+        // Otherwise, the INVOKESTATIC to TzResolver causes a NoClassDefFoundError when the class is loaded by the classloader (and can't see said agent).
+        try {
+            java.security.CodeSource cs =
+                HytaleTzAgent.class.getProtectionDomain().getCodeSource();
+            if (cs != null) {
+                inst.appendToBootstrapClassLoaderSearch(
+                    new java.util.jar.JarFile(cs.getLocation().toURI().getPath()));
+            }
+        } catch (Exception e) {
+            System.err.println("[HytaleTimezoneFix] Could not append agent to bootstrap classpath, " +
+                "TzResolver may be invisible at runtime: " + e);
+        }
         inst.addTransformer(new LogFormatterTransformer(), true);
-
         // Re-transform if class was somehow already loaded
         for (Class<?> cls : inst.getAllLoadedClasses()) {
             if ("com.hypixel.hytale.logger.backend.HytaleLogFormatter".equals(cls.getName())) {
@@ -37,22 +54,29 @@ public class HytaleTzAgent {
         }
 
         try {
-            System.out.println("[HytaleTimezoneFix] Loaded — log timestamps will use: " + TzResolver.resolvedZoneId());
+            System.out.println("[HytaleTimezoneFix] Resolution ready! Log timestamps will use: " + TzResolver.resolvedZoneId());
         } catch (Throwable t) {
             System.err.println("[HytaleTimezoneFix] Timezone resolution failed, server will likely fall back to UTC: " + t);
         }
     }
 
-    // Also support attach-after-start
+    // Also support attach after start
     public static void agentmain(String agentArgs, Instrumentation inst) {
         premain(agentArgs, inst);
     }
 
-    // -------------------------------------------------------------------------
-
     static class LogFormatterTransformer implements ClassFileTransformer {
-
         private static final String TARGET_CLASS = "com/hypixel/hytale/logger/backend/HytaleLogFormatter";
+
+        /**
+         * Guard against double-patching.
+         *
+         * When Hytale's EarlyPlugin system is active, TransformingClassLoader
+         * defines classes from HytaleServer.jar after passing them through its
+         * ClassTransformer list. Our transformer fires during that pass AND again at the final class definition point. 
+         * Without this guard, HytaleLogFormatter is patched twice; the second pass corrupts the already patched bytecode.
+         */
+        private final AtomicBoolean patched = new AtomicBoolean(false);
 
         @Override
         public byte[] transform(
@@ -64,21 +88,41 @@ public class HytaleTzAgent {
 
             if (!TARGET_CLASS.equals(className)) return null;
 
+            if (!patched.compareAndSet(false, true)) {
+                System.out.println("[HytaleTimezoneFix] Skipping duplicate transform of HytaleLogFormatter");
+                return null; // null = leave bytecode unchanged
+            }
+
+            // When triggered by the EarlyPlugin, `loader` is Hytale's TransformingClassLoader, which sends secure packages to the
+            // original appClassLoader and can therefore see all server classes. When there are no early plugins, `loader` is whatever classloader
+            // is defining HytaleLogFormatter. Fall back to the system classloader only as a last resort.
+            final ClassLoader targetLoader = (loader != null)
+                    ? loader
+                    : ClassLoader.getSystemClassLoader();
+
             try {
                 ClassReader cr = new ClassReader(classfileBuffer);
-                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES);
+                // Override getClassLoader() so ASM's compute frames logic resolves HytaleLogFormatter's hierarchy 
+                // through `targetLoader` rather than the system classloader.
+                ClassWriter cw = new ClassWriter(cr, ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES) {
+                    @Override
+                    protected ClassLoader getClassLoader() {
+                        return targetLoader;
+                    }
+                };
+
                 cr.accept(new LogFormatterClassVisitor(cw), ClassReader.EXPAND_FRAMES);
-                byte[] patched = cw.toByteArray();
+                byte[] patchedBytes = cw.toByteArray();
                 System.out.println("[HytaleTimezoneFix] Successfully patched HytaleLogFormatter");
-                return patched;
+                return patchedBytes;
             } catch (Throwable e) {
                 System.err.println("[HytaleTimezoneFix] Patch failed, class will remain unmodified: " + e);
+                // Reset so a retransform attempt can try again
+                patched.set(false);
                 return null;
             }
         }
     }
-
-    // -------------------------------------------------------------------------
 
     static class LogFormatterClassVisitor extends ClassVisitor {
         LogFormatterClassVisitor(ClassVisitor cv) {
@@ -95,8 +139,6 @@ public class HytaleTzAgent {
             return mv;
         }
     }
-
-    // -------------------------------------------------------------------------
 
     static class UtcReplacingMethodVisitor extends MethodVisitor {
 
